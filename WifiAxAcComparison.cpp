@@ -4,61 +4,274 @@
 #include "ns3/wifi-module.h"
 #include "ns3/mobility-module.h"
 #include "ns3/applications-module.h"
+#include "ns3/flow-monitor-module.h"
 #include "ns3/he-phy.h"
 #include "ns3/spectrum-module.h"
 
 #include <cmath>
+#include <cstdint>
+#include <iomanip>
+#include <map>
 #include <numbers>
+#include <numeric>
 #include <sstream>
 #include <string>
+#include <vector>
 
 using namespace ns3;
+
+namespace
+{
+
+struct UserPerformance
+{
+    double dlThroughputMbps{0.0};
+    double ulThroughputMbps{0.0};
+    double totalThroughputMbps{0.0};
+    double avgDelayMs{0.0};
+    uint64_t txPackets{0};
+    uint64_t rxPackets{0};
+    double delaySumSeconds{0.0};
+};
+
+struct PerformanceMetrics
+{
+    std::vector<UserPerformance> perUser;
+    double totalNetworkThroughputMbps{0.0};
+    double jainFairness{0.0};
+    double avgPacketDelayMs{0.0};
+    double spectralEfficiencyBpsPerHz{0.0};
+    double dropRatePercent{0.0};
+    uint64_t totalTxPackets{0};
+    uint64_t totalRxPackets{0};
+    std::map<uint32_t, uint64_t> dropReasonsByCode;
+};
+
+double
+ComputeJainFairness(const std::vector<double>& values)
+{
+    if (values.empty())
+    {
+        return 0.0;
+    }
+
+    const double sum = std::accumulate(values.begin(), values.end(), 0.0);
+    const double sumSquares =
+        std::accumulate(values.begin(), values.end(), 0.0, [](double acc, double v) {
+            return acc + v * v;
+        });
+
+    if (sumSquares <= 0.0)
+    {
+        return 0.0;
+    }
+
+    return (sum * sum) / (static_cast<double>(values.size()) * sumSquares);
+}
+
+std::string
+FlowDropReasonToString(uint32_t code)
+{
+    switch (code)
+    {
+    case 0:
+        return "DROP_NO_ROUTE";
+    case 1:
+        return "DROP_TTL_EXPIRE";
+    case 2:
+        return "DROP_BAD_CHECKSUM";
+    case 3:
+        return "DROP_QUEUE";
+    case 4:
+        return "DROP_QUEUE_DISC";
+    case 5:
+        return "DROP_INTERFACE_DOWN";
+    case 6:
+        return "DROP_ROUTE_ERROR";
+    case 7:
+        return "DROP_FRAGMENT_TIMEOUT";
+    default:
+        return "UNKNOWN_REASON";
+    }
+}
+
+PerformanceMetrics
+CollectPerformanceMetrics(const std::map<FlowId, FlowMonitor::FlowStats>& stats,
+                          Ptr<Ipv4FlowClassifier> classifier,
+                          uint32_t nUsers,
+                          uint16_t dlBasePort,
+                          uint16_t ulBasePort,
+                          double activeDurationSeconds,
+                          uint32_t channelWidthMhz)
+{
+    PerformanceMetrics metrics;
+    metrics.perUser.resize(nUsers);
+
+    uint64_t totalRxBytes = 0;
+    double totalDelaySeconds = 0.0;
+
+    for (const auto& [flowId, st] : stats)
+    {
+        const auto tuple = classifier->FindFlow(flowId);
+        if (tuple.protocol != 17) // UDP only
+        {
+            continue;
+        }
+
+        bool isDl = false;
+        bool isUl = false;
+        uint32_t userIndex = 0;
+
+        if (tuple.destinationPort >= dlBasePort && tuple.destinationPort < dlBasePort + nUsers)
+        {
+            isDl = true;
+            userIndex = tuple.destinationPort - dlBasePort;
+        }
+        else if (tuple.destinationPort >= ulBasePort && tuple.destinationPort < ulBasePort + nUsers)
+        {
+            isUl = true;
+            userIndex = tuple.destinationPort - ulBasePort;
+        }
+        else
+        {
+            continue;
+        }
+
+        const double throughputMbps = (st.rxBytes * 8.0) / (activeDurationSeconds * 1e6);
+        auto& user = metrics.perUser[userIndex];
+        if (isDl)
+        {
+            user.dlThroughputMbps += throughputMbps;
+        }
+        if (isUl)
+        {
+            user.ulThroughputMbps += throughputMbps;
+        }
+        user.txPackets += st.txPackets;
+        user.rxPackets += st.rxPackets;
+        user.delaySumSeconds += st.delaySum.GetSeconds();
+
+        metrics.totalTxPackets += st.txPackets;
+        metrics.totalRxPackets += st.rxPackets;
+        totalRxBytes += st.rxBytes;
+        totalDelaySeconds += st.delaySum.GetSeconds();
+
+        for (uint32_t reasonCode = 0; reasonCode < st.packetsDropped.size(); ++reasonCode)
+        {
+            if (st.packetsDropped[reasonCode] > 0)
+            {
+                metrics.dropReasonsByCode[reasonCode] += st.packetsDropped[reasonCode];
+            }
+        }
+    }
+
+    std::vector<double> userTotals;
+    userTotals.reserve(nUsers);
+    for (auto& user : metrics.perUser)
+    {
+        user.totalThroughputMbps = user.dlThroughputMbps + user.ulThroughputMbps;
+        user.avgDelayMs = (user.rxPackets > 0) ? (user.delaySumSeconds * 1000.0 / user.rxPackets) : 0.0;
+        userTotals.push_back(user.totalThroughputMbps);
+    }
+
+    metrics.totalNetworkThroughputMbps = (totalRxBytes * 8.0) / (activeDurationSeconds * 1e6);
+    metrics.jainFairness = ComputeJainFairness(userTotals);
+    metrics.avgPacketDelayMs =
+        (metrics.totalRxPackets > 0) ? (totalDelaySeconds * 1000.0 / metrics.totalRxPackets) : 0.0;
+    metrics.spectralEfficiencyBpsPerHz =
+        (totalRxBytes * 8.0 / activeDurationSeconds) / (static_cast<double>(channelWidthMhz) * 1e6);
+    metrics.dropRatePercent =
+        (metrics.totalTxPackets > 0)
+            ? (100.0 * static_cast<double>(metrics.totalTxPackets - metrics.totalRxPackets) /
+               static_cast<double>(metrics.totalTxPackets))
+            : 0.0;
+
+    return metrics;
+}
+
+void
+PrintPerformanceMetrics(const PerformanceMetrics& metrics)
+{
+    double totalDlThroughput = 0.0;
+    double totalUlThroughput = 0.0;
+    for (const auto& user : metrics.perUser)
+    {
+        totalDlThroughput += user.dlThroughputMbps;
+        totalUlThroughput += user.ulThroughputMbps;
+    }
+
+    std::cout << std::fixed << std::setprecision(4);
+    std::cout << "\n--- Performance Metrics ---\n";
+    // Keep these exact labels for compatibility with sweep scripts.
+    std::cout << "Total DL Throughput: " << totalDlThroughput << " Mbps\n";
+    std::cout << "Total UL Throughput: " << totalUlThroughput << " Mbps\n";
+    std::cout << "Total Network Throughput: " << metrics.totalNetworkThroughputMbps << " Mbps\n";
+    std::cout << "Jain's fairness index: " << metrics.jainFairness << "\n";
+    std::cout << "Average packet delay: " << metrics.avgPacketDelayMs << " ms\n";
+    std::cout << "Spectral efficiency: " << metrics.spectralEfficiencyBpsPerHz << " bps/Hz\n";
+    std::cout << "Packet drop rate: " << metrics.dropRatePercent << "%\n";
+
+    std::cout << "\nIndividual user throughput and delay:\n";
+    for (uint32_t i = 0; i < metrics.perUser.size(); ++i)
+    {
+        const auto& user = metrics.perUser[i];
+        std::cout << "User " << i << ": DL=" << user.dlThroughputMbps << " Mbps, UL="
+                  << user.ulThroughputMbps << " Mbps, TOTAL=" << user.totalThroughputMbps
+                  << " Mbps, delay=" << user.avgDelayMs << " ms\n";
+    }
+
+    std::cout << "\nPacket drop reasons:\n";
+    if (metrics.dropReasonsByCode.empty())
+    {
+        std::cout << "  none observed\n";
+    }
+    else
+    {
+        for (const auto& [code, count] : metrics.dropReasonsByCode)
+        {
+            std::cout << "  code " << code << " (" << FlowDropReasonToString(code)
+                      << "): " << count << " packets\n";
+        }
+    }
+}
+
+} // namespace
 
 int
 main(int argc, char* argv[])
 {
     std::string standard = "ax";
-    std::string trafficMode = "mixed"; // mixed, downlink, uplink, both
+    std::string trafficMode = "both"; // downlink, uplink, both
     uint32_t nUsers = 8;
     double simTime = 10.0;
     double appStart = 1.0;
     double staDistance = 5.0;
     uint32_t channelWidthMhz = 80;
     uint8_t mcs = 5;
-    std::string trafficProfile = "service-mix"; // service-mix or random
-    std::string loadLevel = "medium";          // low, medium, saturated
-    double minOfferedLoadPerUserMbps = 5.0;
-    double maxOfferedLoadPerUserMbps = 25.0;
-
-    const uint32_t randomPacketSize = 1200;
-    const uint32_t voicePacketSize = 160;
-    const double randomPacketIntervalMs = 2.0;
-    const double voicePacketIntervalMs = 20.0;
-    const uint32_t videoPacketSize = 1000;
-    const double videoPacketIntervalMs = 2.0;
-    const uint32_t dataPacketSize = 1200;
-    const double dataPacketIntervalMs = 0.5;
+    double minimumUserLoadMbps = 0.0;
+    double maximumUserLoadMbps = 30.0;
+    uint32_t packetSize = 1200;
+    const uint32_t predefinedSeed = 7;
 
     bool enableUlOfdma = false;
     bool enableDlOfdma = false;
 
     CommandLine cmd;
     cmd.AddValue("standard", "ac or ax", standard);
-    cmd.AddValue("trafficMode", "Traffic mode: mixed, downlink, uplink, both", trafficMode);
+    cmd.AddValue("trafficMode", "Traffic mode: downlink, uplink, both", trafficMode);
     cmd.AddValue("nUsers", "Number of users", nUsers);
     cmd.AddValue("simTime", "Simulation time in seconds", simTime);
     cmd.AddValue("appStart", "Application start time in seconds", appStart);
     cmd.AddValue("staDistance", "Deployment radius around AP in meters", staDistance);
     cmd.AddValue("channelWidth", "Channel width in MHz", channelWidthMhz);
     cmd.AddValue("mcs", "MCS index (ax:0-11, ac:0-9)", mcs);
-    cmd.AddValue("trafficProfile", "Traffic profile: service-mix or random", trafficProfile);
-    cmd.AddValue("loadLevel", "Traffic load level: low, medium, saturated", loadLevel);
-    cmd.AddValue("minOfferedLoadPerUserMbps",
-                 "Minimum random offered UDP load per user in Mbps",
-                 minOfferedLoadPerUserMbps);
-    cmd.AddValue("maxOfferedLoadPerUserMbps",
-                 "Maximum random offered UDP load per user in Mbps",
-                 maxOfferedLoadPerUserMbps);
+    cmd.AddValue("minSpeed",
+                 "Minimum per-user UDP offered load in Mbps",
+                 minimumUserLoadMbps);
+    cmd.AddValue("maxSpeed",
+                 "Maximum per-user UDP offered load in Mbps",
+                 maximumUserLoadMbps);
+    cmd.AddValue("packetSize", "UDP payload size in bytes", packetSize);
     cmd.Parse(argc, argv);
 
     if (standard != "ax" && standard != "ac")
@@ -69,30 +282,29 @@ main(int argc, char* argv[])
     {
         NS_ABORT_MSG("nUsers must be >= 1");
     }
-    if (trafficMode != "mixed" && trafficMode != "downlink" && trafficMode != "uplink" &&
-        trafficMode != "both")
+    if (trafficMode != "downlink" && trafficMode != "uplink" && trafficMode != "both")
     {
-        NS_ABORT_MSG("trafficMode must be one of: mixed, downlink, uplink, both");
-    }
-    if (trafficProfile != "service-mix" && trafficProfile != "random")
-    {
-        NS_ABORT_MSG("trafficProfile must be 'service-mix' or 'random'");
-    }
-    if (loadLevel != "low" && loadLevel != "medium" && loadLevel != "saturated")
-    {
-        NS_ABORT_MSG("loadLevel must be one of: low, medium, saturated");
+        NS_ABORT_MSG("trafficMode must be one of: downlink, uplink, both");
     }
     if (simTime <= appStart)
     {
         NS_ABORT_MSG("simTime must be greater than appStart");
     }
-    if (minOfferedLoadPerUserMbps <= 0.0 || maxOfferedLoadPerUserMbps <= 0.0)
+    if (minimumUserLoadMbps < 0.0)
     {
-        NS_ABORT_MSG("Offered load bounds must be > 0");
+        NS_ABORT_MSG("minSpeed must be >= 0");
     }
-    if (maxOfferedLoadPerUserMbps < minOfferedLoadPerUserMbps)
+    if (maximumUserLoadMbps <= 0.0)
     {
-        NS_ABORT_MSG("maxOfferedLoadPerUserMbps must be >= minOfferedLoadPerUserMbps");
+        NS_ABORT_MSG("maxOfferedLoadPerUserMbps must be > 0");
+    }
+    if (minimumUserLoadMbps > maximumUserLoadMbps)
+    {
+        NS_ABORT_MSG("minSpeed must be <= maxSpeed");
+    }
+    if (packetSize == 0)
+    {
+        NS_ABORT_MSG("packetSize must be >= 1");
     }
     if (standard == "ac" && mcs > 9)
     {
@@ -103,42 +315,19 @@ main(int argc, char* argv[])
         NS_ABORT_MSG("For 802.11ax, mcs must be in [0,11]");
     }
 
-    uint32_t nBothUsers = 0;
-    uint32_t nDownlinkUsers = 0;
-    uint32_t nUplinkUsers = 0;
-    if (trafficMode == "mixed")
-    {
-        // Near-even 3-way split: both, DL-only, UL-only.
-        nBothUsers = nUsers / 3;
-        nDownlinkUsers = nUsers / 3;
-        nUplinkUsers = nUsers / 3;
-        uint32_t remainder = nUsers - (nBothUsers + nDownlinkUsers + nUplinkUsers);
-        if (remainder > 0)
-        {
-            nBothUsers++;
-            remainder--;
-        }
-        if (remainder > 0)
-        {
-            nDownlinkUsers++;
-            remainder--;
-        }
-        if (remainder > 0)
-        {
-            nUplinkUsers++;
-        }
-    }
+    const bool hasDownlinkTraffic = (trafficMode == "downlink" || trafficMode == "both");
+    const bool hasUplinkTraffic = (trafficMode == "uplink" || trafficMode == "both");
 
-    // For this scenario, enabling 11ax always enables both UL and DL OFDMA.
+    // For AX, keep OFDMA enabled only in active traffic directions.
     if (standard == "ax")
     {
-        enableDlOfdma = true;
-        enableUlOfdma = true;
+        enableDlOfdma = hasDownlinkTraffic;
+        enableUlOfdma = hasUplinkTraffic;
     }
 
     // Reproducible RNG
     RngSeedManager::SetSeed(12345);
-    RngSeedManager::SetRun(1);
+    RngSeedManager::SetRun(predefinedSeed + 1);
 
     NodeContainer staNodes;
     staNodes.Create(nUsers);
@@ -211,7 +400,12 @@ main(int argc, char* argv[])
 
         if (enableDlOfdma || enableUlOfdma)
         {
+            const uint8_t maxStationsPerDlMu = std::min<uint8_t>(8, static_cast<uint8_t>(nUsers));
             mac.SetMultiUserScheduler("ns3::RrMultiUserScheduler",
+                                      "NStations",
+                                      UintegerValue(maxStationsPerDlMu),
+                                      "EnableTxopSharing",
+                                      BooleanValue(false),
                                       "EnableUlOfdma", BooleanValue(enableUlOfdma),
                                       "EnableBsrp", BooleanValue(false));
         }
@@ -279,25 +473,16 @@ main(int argc, char* argv[])
     ApplicationContainer ulSourceApps;
 
     Ptr<UniformRandomVariable> rateRv = CreateObject<UniformRandomVariable>();
-    rateRv->SetAttribute("Min", DoubleValue(minOfferedLoadPerUserMbps));
-    rateRv->SetAttribute("Max", DoubleValue(maxOfferedLoadPerUserMbps));
+    rateRv->SetAttribute("Min", DoubleValue(minimumUserLoadMbps));
+    rateRv->SetAttribute("Max", DoubleValue(maximumUserLoadMbps));
     rateRv->SetStream(1);
 
     std::vector<double> userRatesMbps;
     userRatesMbps.reserve(nUsers);
-    std::vector<uint32_t> userPacketSizes;
-    userPacketSizes.reserve(nUsers);
-    std::vector<double> userIntervalsMs;
-    userIntervalsMs.reserve(nUsers);
-    std::vector<std::string> userTrafficTypes;
-    userTrafficTypes.reserve(nUsers);
-    std::vector<bool> userHasDlFlow;
-    std::vector<bool> userHasUlFlow;
-    userHasDlFlow.reserve(nUsers);
-    userHasUlFlow.reserve(nUsers);
-
-    const double loadMultiplier =
-        (loadLevel == "low") ? 2.0 : ((loadLevel == "saturated") ? 0.5 : 1.0);
+    std::vector<double> userDlRatesMbps;
+    userDlRatesMbps.reserve(nUsers);
+    std::vector<double> userUlRatesMbps;
+    userUlRatesMbps.reserve(nUsers);
 
     for (uint32_t i = 0; i < nUsers; ++i)
     {
@@ -311,100 +496,35 @@ main(int argc, char* argv[])
         ulSinkApps.Add(ulSink.Install(apNode.Get(0)));
 
         const double userRateMbps = rateRv->GetValue();
-        std::string trafficType = "random";
-        uint32_t userPacketSize = randomPacketSize;
-        double userIntervalMs = randomPacketIntervalMs;
-        double effectiveRateMbps = userRateMbps;
+        userRatesMbps.push_back(userRateMbps);
+        const bool bothDirections = hasDownlinkTraffic && hasUplinkTraffic;
+        const double dlRateMbps = hasDownlinkTraffic ? (bothDirections ? userRateMbps * 0.5 : userRateMbps)
+                                                     : 0.0;
+        const double ulRateMbps = hasUplinkTraffic ? (bothDirections ? userRateMbps * 0.5 : userRateMbps)
+                                                   : 0.0;
+        userDlRatesMbps.push_back(dlRateMbps);
+        userUlRatesMbps.push_back(ulRateMbps);
 
-        if (trafficProfile == "service-mix")
-        {
-            if ((i % 3) == 0)
-            {
-                trafficType = "voice";
-                userPacketSize = voicePacketSize;
-                userIntervalMs = voicePacketIntervalMs * loadMultiplier;
-            }
-            else if ((i % 3) == 1)
-            {
-                trafficType = "video";
-                userPacketSize = videoPacketSize;
-                userIntervalMs = videoPacketIntervalMs * loadMultiplier;
-            }
-            else
-            {
-                trafficType = "data";
-                userPacketSize = dataPacketSize;
-                userIntervalMs = dataPacketIntervalMs * loadMultiplier;
-            }
-            effectiveRateMbps = (static_cast<double>(userPacketSize) * 8.0) / (userIntervalMs * 1000.0);
-        }
-        else
-        {
-            userIntervalMs = randomPacketIntervalMs * loadMultiplier;
-            effectiveRateMbps =
-                (static_cast<double>(userPacketSize) * 8.0) / (userIntervalMs * 1000.0);
-        }
+        const uint64_t dlRateBps = static_cast<uint64_t>(dlRateMbps * 1e6);
+        const uint64_t ulRateBps = static_cast<uint64_t>(ulRateMbps * 1e6);
 
-        userTrafficTypes.push_back(trafficType);
-        userPacketSizes.push_back(userPacketSize);
-        userIntervalsMs.push_back(userIntervalMs);
-        userRatesMbps.push_back(effectiveRateMbps);
-        const uint64_t userRateBps = static_cast<uint64_t>(effectiveRateMbps * 1e6);
-
-        bool enableDlForUser = false;
-        bool enableUlForUser = false;
-        if (trafficMode == "downlink")
-        {
-            enableDlForUser = true;
-        }
-        else if (trafficMode == "uplink")
-        {
-            enableUlForUser = true;
-        }
-        else if (trafficMode == "both")
-        {
-            enableDlForUser = true;
-            enableUlForUser = true;
-        }
-        else // mixed
-        {
-            if (i < nBothUsers)
-            {
-                enableDlForUser = true;
-                enableUlForUser = true;
-            }
-            else if (i < (nBothUsers + nDownlinkUsers))
-            {
-                enableDlForUser = true;
-                enableUlForUser = false;
-            }
-            else
-            {
-                enableDlForUser = false;
-                enableUlForUser = true;
-            }
-        }
-
-        userHasDlFlow.push_back(enableDlForUser);
-        userHasUlFlow.push_back(enableUlForUser);
-
-        if (enableDlForUser)
+        if (hasDownlinkTraffic && dlRateBps > 0)
         {
             OnOffHelper dlSource("ns3::UdpSocketFactory",
                                  InetSocketAddress(staInterfaces.GetAddress(i), dlPort));
-            dlSource.SetAttribute("DataRate", DataRateValue(DataRate(userRateBps)));
-            dlSource.SetAttribute("PacketSize", UintegerValue(userPacketSize));
+            dlSource.SetAttribute("DataRate", DataRateValue(DataRate(dlRateBps)));
+            dlSource.SetAttribute("PacketSize", UintegerValue(packetSize));
             dlSource.SetAttribute("StartTime", TimeValue(Seconds(appStart)));
             dlSource.SetAttribute("StopTime", TimeValue(Seconds(simTime)));
             dlSourceApps.Add(dlSource.Install(apNode.Get(0)));
         }
 
-        if (enableUlForUser)
+        if (hasUplinkTraffic && ulRateBps > 0)
         {
             OnOffHelper ulSource("ns3::UdpSocketFactory",
                                  InetSocketAddress(apInterfaces.GetAddress(0), ulPort));
-            ulSource.SetAttribute("DataRate", DataRateValue(DataRate(userRateBps)));
-            ulSource.SetAttribute("PacketSize", UintegerValue(userPacketSize));
+            ulSource.SetAttribute("DataRate", DataRateValue(DataRate(ulRateBps)));
+            ulSource.SetAttribute("PacketSize", UintegerValue(packetSize));
             ulSource.SetAttribute("StartTime", TimeValue(Seconds(appStart)));
             ulSource.SetAttribute("StopTime", TimeValue(Seconds(simTime)));
             ulSourceApps.Add(ulSource.Install(staNodes.Get(i)));
@@ -413,67 +533,39 @@ main(int argc, char* argv[])
 
     std::cout << "Using standard: " << standard << "\n";
     std::cout << "Traffic mode: " << trafficMode << "\n";
-    std::cout << "Traffic profile: " << trafficProfile << "\n";
-    std::cout << "Load level: " << loadLevel << "\n";
-    if (trafficMode == "mixed")
-    {
-        std::cout << "Mixed split: " << nBothUsers << " both, " << nDownlinkUsers
-                  << " DL-only, " << nUplinkUsers << " UL-only users\n";
-    }
+    std::cout << "Per-user offered load range: [" << minimumUserLoadMbps << ", "
+              << maximumUserLoadMbps << "] Mbps\n";
+    std::cout << "Packet size: " << packetSize << " B\n";
+    std::cout << "Predefined seed: " << predefinedSeed << "\n";
     std::cout << "DL OFDMA enabled: " << (enableDlOfdma ? "true" : "false") << "\n";
     std::cout << "UL OFDMA enabled: " << (enableUlOfdma ? "true" : "false") << "\n";
-    std::cout << "User offered loads (Mbps):\n";
+    std::cout << "Sampled per-user offered loads (Mbps):\n";
     for (uint32_t i = 0; i < nUsers; ++i)
     {
-        std::string role;
-        if (userHasDlFlow[i] && userHasUlFlow[i])
-        {
-            role = "DL+UL";
-        }
-        else if (userHasDlFlow[i])
-        {
-            role = "DL";
-        }
-        else
-        {
-            role = "UL";
-        }
-        std::cout << "  User " << i << " (" << role << ", " << userTrafficTypes[i]
-                  << "): rate=" << userRatesMbps[i] << " Mbps"
-                  << ", pktSize=" << userPacketSizes[i] << " B"
-                  << ", interval=" << userIntervalsMs[i] << " ms\n";
+        std::cout << "  User " << i << ": total=" << userRatesMbps[i] << ", dl="
+                  << userDlRatesMbps[i] << ", ul=" << userUlRatesMbps[i] << "\n";
     }
 
-    Simulator::Stop(Seconds(simTime));
+    FlowMonitorHelper flowMonitorHelper;
+    Ptr<FlowMonitor> flowMonitor = flowMonitorHelper.InstallAll();
+
+    // Add a short cleanup period after generators stop so queued frames can drain.
+    Simulator::Stop(Seconds(simTime + 1.0));
     Simulator::Run();
 
-    std::cout << "\n--- Throughput Results ---\n";
+    flowMonitor->CheckForLostPackets();
+    Ptr<Ipv4FlowClassifier> classifier =
+        DynamicCast<Ipv4FlowClassifier>(flowMonitorHelper.GetClassifier());
+    const auto stats = flowMonitor->GetFlowStats();
 
-    double totalDlThroughput = 0;
-    double totalUlThroughput = 0;
-    const double activeDuration = simTime - appStart;
-
-    for (uint32_t i = 0; i < nUsers; ++i)
-    {
-        Ptr<PacketSink> dlSink = DynamicCast<PacketSink>(dlSinkApps.Get(i));
-        Ptr<PacketSink> ulSink = DynamicCast<PacketSink>(ulSinkApps.Get(i));
-
-        const double dlThroughput = userHasDlFlow[i] ? (dlSink->GetTotalRx() * 8.0) / (activeDuration * 1e6)
-                                                     : 0.0;
-        const double ulThroughput = userHasUlFlow[i] ? (ulSink->GetTotalRx() * 8.0) / (activeDuration * 1e6)
-                                                     : 0.0;
-
-        std::cout << "User " << i << ": DL=" << dlThroughput << " Mbps, UL=" << ulThroughput
-                  << " Mbps\n";
-
-        totalDlThroughput += dlThroughput;
-        totalUlThroughput += ulThroughput;
-    }
-
-    std::cout << "\nTotal DL Throughput: " << totalDlThroughput << " Mbps\n";
-    std::cout << "Total UL Throughput: " << totalUlThroughput << " Mbps\n";
-    std::cout << "Total Network Throughput: " << (totalDlThroughput + totalUlThroughput)
-              << " Mbps\n";
+    const auto metrics = CollectPerformanceMetrics(stats,
+                                                   classifier,
+                                                   nUsers,
+                                                   dlBasePort,
+                                                   ulBasePort,
+                                                   simTime - appStart,
+                                                   channelWidthMhz);
+    PrintPerformanceMetrics(metrics);
 
     Simulator::Destroy();
 }

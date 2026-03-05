@@ -10,6 +10,7 @@
 #include <cmath>
 #include <numbers>
 #include <sstream>
+#include <string>
 
 using namespace ns3;
 
@@ -24,9 +25,19 @@ main(int argc, char* argv[])
     double staDistance = 5.0;
     uint32_t channelWidthMhz = 80;
     uint8_t mcs = 5;
-    uint32_t packetSize = 1200;
+    std::string trafficProfile = "service-mix"; // service-mix or random
+    std::string loadLevel = "medium";          // low, medium, saturated
     double minOfferedLoadPerUserMbps = 5.0;
     double maxOfferedLoadPerUserMbps = 25.0;
+
+    const uint32_t randomPacketSize = 1200;
+    const uint32_t voicePacketSize = 160;
+    const double randomPacketIntervalMs = 2.0;
+    const double voicePacketIntervalMs = 20.0;
+    const uint32_t videoPacketSize = 1000;
+    const double videoPacketIntervalMs = 2.0;
+    const uint32_t dataPacketSize = 1200;
+    const double dataPacketIntervalMs = 0.5;
 
     bool enableUlOfdma = false;
     bool enableDlOfdma = false;
@@ -37,10 +48,11 @@ main(int argc, char* argv[])
     cmd.AddValue("nUsers", "Number of users", nUsers);
     cmd.AddValue("simTime", "Simulation time in seconds", simTime);
     cmd.AddValue("appStart", "Application start time in seconds", appStart);
-    cmd.AddValue("staDistance", "Distance from AP to each STA in meters", staDistance);
+    cmd.AddValue("staDistance", "Deployment radius around AP in meters", staDistance);
     cmd.AddValue("channelWidth", "Channel width in MHz", channelWidthMhz);
     cmd.AddValue("mcs", "MCS index (ax:0-11, ac:0-9)", mcs);
-    cmd.AddValue("packetSize", "UDP packet size in bytes", packetSize);
+    cmd.AddValue("trafficProfile", "Traffic profile: service-mix or random", trafficProfile);
+    cmd.AddValue("loadLevel", "Traffic load level: low, medium, saturated", loadLevel);
     cmd.AddValue("minOfferedLoadPerUserMbps",
                  "Minimum random offered UDP load per user in Mbps",
                  minOfferedLoadPerUserMbps);
@@ -62,9 +74,13 @@ main(int argc, char* argv[])
     {
         NS_ABORT_MSG("trafficMode must be one of: mixed, downlink, uplink, both");
     }
-    if (packetSize == 0)
+    if (trafficProfile != "service-mix" && trafficProfile != "random")
     {
-        NS_ABORT_MSG("packetSize must be >= 1");
+        NS_ABORT_MSG("trafficProfile must be 'service-mix' or 'random'");
+    }
+    if (loadLevel != "low" && loadLevel != "medium" && loadLevel != "saturated")
+    {
+        NS_ABORT_MSG("loadLevel must be one of: low, medium, saturated");
     }
     if (simTime <= appStart)
     {
@@ -222,11 +238,22 @@ main(int argc, char* argv[])
     MobilityHelper mobility;
     Ptr<ListPositionAllocator> positionAlloc = CreateObject<ListPositionAllocator>();
     positionAlloc->Add(Vector(0.0, 0.0, 0.0));
+
+    Ptr<UniformRandomVariable> angleRv = CreateObject<UniformRandomVariable>();
+    angleRv->SetAttribute("Min", DoubleValue(0.0));
+    angleRv->SetAttribute("Max", DoubleValue(2.0 * std::numbers::pi));
+    angleRv->SetStream(2);
+
+    Ptr<UniformRandomVariable> radiusRv = CreateObject<UniformRandomVariable>();
+    radiusRv->SetAttribute("Min", DoubleValue(0.0));
+    radiusRv->SetAttribute("Max", DoubleValue(1.0));
+    radiusRv->SetStream(3);
+
     for (uint32_t i = 0; i < nUsers; ++i)
     {
-        const double angle = 2.0 * std::numbers::pi * static_cast<double>(i) /
-                             static_cast<double>(nUsers);
-        positionAlloc->Add(Vector(staDistance * std::cos(angle), staDistance * std::sin(angle), 0.0));
+        const double angle = angleRv->GetValue();
+        const double radius = std::sqrt(radiusRv->GetValue()) * staDistance;
+        positionAlloc->Add(Vector(radius * std::cos(angle), radius * std::sin(angle), 0.0));
     }
     mobility.SetPositionAllocator(positionAlloc);
     mobility.SetMobilityModel("ns3::ConstantPositionMobilityModel");
@@ -258,10 +285,19 @@ main(int argc, char* argv[])
 
     std::vector<double> userRatesMbps;
     userRatesMbps.reserve(nUsers);
+    std::vector<uint32_t> userPacketSizes;
+    userPacketSizes.reserve(nUsers);
+    std::vector<double> userIntervalsMs;
+    userIntervalsMs.reserve(nUsers);
+    std::vector<std::string> userTrafficTypes;
+    userTrafficTypes.reserve(nUsers);
     std::vector<bool> userHasDlFlow;
     std::vector<bool> userHasUlFlow;
     userHasDlFlow.reserve(nUsers);
     userHasUlFlow.reserve(nUsers);
+
+    const double loadMultiplier =
+        (loadLevel == "low") ? 2.0 : ((loadLevel == "saturated") ? 0.5 : 1.0);
 
     for (uint32_t i = 0; i < nUsers; ++i)
     {
@@ -275,8 +311,45 @@ main(int argc, char* argv[])
         ulSinkApps.Add(ulSink.Install(apNode.Get(0)));
 
         const double userRateMbps = rateRv->GetValue();
-        userRatesMbps.push_back(userRateMbps);
-        const uint64_t userRateBps = static_cast<uint64_t>(userRateMbps * 1e6);
+        std::string trafficType = "random";
+        uint32_t userPacketSize = randomPacketSize;
+        double userIntervalMs = randomPacketIntervalMs;
+        double effectiveRateMbps = userRateMbps;
+
+        if (trafficProfile == "service-mix")
+        {
+            if ((i % 3) == 0)
+            {
+                trafficType = "voice";
+                userPacketSize = voicePacketSize;
+                userIntervalMs = voicePacketIntervalMs * loadMultiplier;
+            }
+            else if ((i % 3) == 1)
+            {
+                trafficType = "video";
+                userPacketSize = videoPacketSize;
+                userIntervalMs = videoPacketIntervalMs * loadMultiplier;
+            }
+            else
+            {
+                trafficType = "data";
+                userPacketSize = dataPacketSize;
+                userIntervalMs = dataPacketIntervalMs * loadMultiplier;
+            }
+            effectiveRateMbps = (static_cast<double>(userPacketSize) * 8.0) / (userIntervalMs * 1000.0);
+        }
+        else
+        {
+            userIntervalMs = randomPacketIntervalMs * loadMultiplier;
+            effectiveRateMbps =
+                (static_cast<double>(userPacketSize) * 8.0) / (userIntervalMs * 1000.0);
+        }
+
+        userTrafficTypes.push_back(trafficType);
+        userPacketSizes.push_back(userPacketSize);
+        userIntervalsMs.push_back(userIntervalMs);
+        userRatesMbps.push_back(effectiveRateMbps);
+        const uint64_t userRateBps = static_cast<uint64_t>(effectiveRateMbps * 1e6);
 
         bool enableDlForUser = false;
         bool enableUlForUser = false;
@@ -320,7 +393,7 @@ main(int argc, char* argv[])
             OnOffHelper dlSource("ns3::UdpSocketFactory",
                                  InetSocketAddress(staInterfaces.GetAddress(i), dlPort));
             dlSource.SetAttribute("DataRate", DataRateValue(DataRate(userRateBps)));
-            dlSource.SetAttribute("PacketSize", UintegerValue(packetSize));
+            dlSource.SetAttribute("PacketSize", UintegerValue(userPacketSize));
             dlSource.SetAttribute("StartTime", TimeValue(Seconds(appStart)));
             dlSource.SetAttribute("StopTime", TimeValue(Seconds(simTime)));
             dlSourceApps.Add(dlSource.Install(apNode.Get(0)));
@@ -331,7 +404,7 @@ main(int argc, char* argv[])
             OnOffHelper ulSource("ns3::UdpSocketFactory",
                                  InetSocketAddress(apInterfaces.GetAddress(0), ulPort));
             ulSource.SetAttribute("DataRate", DataRateValue(DataRate(userRateBps)));
-            ulSource.SetAttribute("PacketSize", UintegerValue(packetSize));
+            ulSource.SetAttribute("PacketSize", UintegerValue(userPacketSize));
             ulSource.SetAttribute("StartTime", TimeValue(Seconds(appStart)));
             ulSource.SetAttribute("StopTime", TimeValue(Seconds(simTime)));
             ulSourceApps.Add(ulSource.Install(staNodes.Get(i)));
@@ -340,6 +413,8 @@ main(int argc, char* argv[])
 
     std::cout << "Using standard: " << standard << "\n";
     std::cout << "Traffic mode: " << trafficMode << "\n";
+    std::cout << "Traffic profile: " << trafficProfile << "\n";
+    std::cout << "Load level: " << loadLevel << "\n";
     if (trafficMode == "mixed")
     {
         std::cout << "Mixed split: " << nBothUsers << " both, " << nDownlinkUsers
@@ -363,7 +438,10 @@ main(int argc, char* argv[])
         {
             role = "UL";
         }
-        std::cout << "  User " << i << " (" << role << "): " << userRatesMbps[i] << "\n";
+        std::cout << "  User " << i << " (" << role << ", " << userTrafficTypes[i]
+                  << "): rate=" << userRatesMbps[i] << " Mbps"
+                  << ", pktSize=" << userPacketSizes[i] << " B"
+                  << ", interval=" << userIntervalsMs[i] << " ms\n";
     }
 
     Simulator::Stop(Seconds(simTime));

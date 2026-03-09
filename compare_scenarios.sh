@@ -7,6 +7,7 @@ set -euo pipefail
 SIM="WifiAxAcComparison"
 OUT_DIR="results"
 OUT_CSV="${OUT_DIR}/compare_scenarios.csv"
+OUT_LOG="${OUT_DIR}/compare_scenarios_full.log"
 
 N_USERS_LIST=(4 8 16 20)
 TRAFFIC_MODES=(both downlink uplink)
@@ -22,7 +23,8 @@ STA_DISTANCE=5
 
 mkdir -p "${OUT_DIR}"
 
-echo "standard,trafficMode,nUsers,minLoadMbps,maxLoadMbps,packetSize,totalDlMbps,totalUlMbps,totalNetworkMbps" > "${OUT_CSV}"
+echo "standard,trafficMode,nUsers,minLoadMbps,maxLoadMbps,packetSize,totalDlMbps,totalUlMbps,totalNetworkMbps,jainFairness,avgDelayMs,spectralEfficiencyBpsPerHz,packetDropRatePercent" > "${OUT_CSV}"
+echo "" > "${OUT_LOG}"
 
 echo "[1/2] Building ${SIM}..."
 ./ns3 build "${SIM}"
@@ -44,12 +46,28 @@ for standard in "${STANDARDS[@]}"; do
           dl=$(echo "${output}" | awk '/^Total DL Throughput:/ {print $(NF-1)}')
           ul=$(echo "${output}" | awk '/^Total UL Throughput:/ {print $(NF-1)}')
           net=$(echo "${output}" | awk '/^Total Network Throughput:/ {print $(NF-1)}')
+          fairness=$(echo "${output}" | awk -F': ' '/^Jain.*fairness index:/ {print $2}')
+          delay=$(echo "${output}" | awk '/^Average packet delay:/ {print $(NF-1)}')
+          spectral=$(echo "${output}" | awk '/^Spectral efficiency:/ {print $(NF-1)}')
+          drop=$(echo "${output}" | awk -F': ' '/^Packet drop rate:/ {gsub(/%/, "", $2); print $2}')
 
           dl=${dl:-0}
           ul=${ul:-0}
           net=${net:-0}
+          fairness=${fairness:-0}
+          delay=${delay:-0}
+          spectral=${spectral:-0}
+          drop=${drop:-0}
 
-          echo "${standard},${mode},${nUsers},${minLoad},${maxLoad},${PACKET_SIZE},${dl},${ul},${net}" >> "${OUT_CSV}"
+          echo "${standard},${mode},${nUsers},${minLoad},${maxLoad},${PACKET_SIZE},${dl},${ul},${net},${fairness},${delay},${spectral},${drop}" >> "${OUT_CSV}"
+
+          {
+            echo "===== standard=${standard} mode=${mode} nUsers=${nUsers} min=${minLoad} max=${maxLoad} ====="
+            echo "command: ./ns3 run \"${cmd}\""
+            echo "${output}"
+            echo
+          } >> "${OUT_LOG}"
+
           echo "done: standard=${standard} mode=${mode} nUsers=${nUsers} min=${minLoad} max=${maxLoad}"
         done
       done
@@ -57,4 +75,5 @@ for standard in "${STANDARDS[@]}"; do
   done
 done
 
-echo "Sweep complete. Results: ${OUT_CSV}"
+echo "Sweep complete. Summary CSV: ${OUT_CSV}"
+echo "Sweep complete. Full logs: ${OUT_LOG}"
